@@ -20,6 +20,7 @@
 
 #include "DeckLinkAPI_h.h"   // DeckLink C++ SDK (vendored; GUIDs live in DeckLinkAPI_i.c)
 #include "DeckLinkSourceControl.h"   // IDeckLinkSourceControl (engine control surface)
+#include "CaptureAudio.h"            // ClipGuard Media Player: the card's HDMI audio (only when asked)
 
 // Values from DeckLink SDK 14.2 (DeckLinkAPI.h) that this vendored header
 // predates. They are stable ABI — a detected-colours-space fourcc, a frame
@@ -280,6 +281,20 @@ public:
     // Delivers it. If the renderer is slow the queue fills and the callback
     // drops the NEWEST frame — the card is never stuck behind MPCVR.
     bool EnqueueSample(IMediaSample* s);    // true = enqueued (ownership moves)
+
+    // ClipGuard Media Player: the card's HDMI audio (CaptureAudio.h). m_audioCh is the
+    // channel count the input was enabled with (0 = audio not enabled).
+    CaptureAudio m_audio;
+    bool m_audioWanted = false;
+    volatile LONG m_audioCh = 0;
+    void PushAudio(IDeckLinkAudioInputPacket* pkt, LONG fpsNum, LONG fpsDen) {
+        const LONG ch = m_audioCh;
+        if (!pkt || ch == 0) return;
+        void* bytes = nullptr;
+        if (FAILED(pkt->GetBytes(&bytes)) || !bytes) return;
+        m_audio.SetFps(fpsNum, fpsDen);
+        m_audio.Push((const int32_t*)bytes, (long)pkt->GetSampleFrameCount(), (int)ch);
+    }
 
 private:
     CaptureState m_st;
@@ -662,6 +677,14 @@ HRESULT CDeckLinkOutputPin::StartCaptureSession(const wchar_t* deviceName)
     m_cb->Release();
     m_cb = nullptr;              // SDK owns it now; never deref here
 
+    // ClipGuard Media Player asked for the card's audio: start its player (silent
+    // until the card's audio arrives). The input is enabled by the worker.
+    m_audioWanted = m_audio.Wanted();
+    if (m_audioWanted) {
+        m_audio.SetLog(&m_st, [](void* ctx, const char* line) { StateLog((CaptureState*)ctx, "%s", line); });
+        m_audio.Start();
+    }
+
     // Boot the session + forwarder threads. The forwarder owns Deliver; the
     // callback enqueues (bounded) and never blocks on the renderer.
     ResetEvent(m_st.firstDataEvent);
@@ -726,6 +749,7 @@ void CDeckLinkOutputPin::JoinCaptureThreads()
     if (m_dataEvent) SetEvent(m_dataEvent);
     if (m_forwarder.joinable()) m_forwarder.join();
     if (m_worker.joinable()) m_worker.join();
+    m_audio.Stop();
     if (m_dataEvent) { CloseHandle(m_dataEvent); m_dataEvent = nullptr; }
     if (m_input) { m_input->Release(); m_input = nullptr; }
     if (m_dev)   { m_dev->Release();   m_dev = nullptr; }
@@ -853,7 +877,13 @@ void CDeckLinkOutputPin::WorkerLoop()
         // would deadlock it); the worker owns the SDK stop. Runs on this
         // thread — never inside an SDK callback.
         if (!m_st.active && m_st.stopPending && m_st.started) {
-            m_input->StopStreams(); m_st.started = 0;
+            // ClipGuard 2.72.0: StopStreams waits for an in-flight SDK callback to return,
+            // and that callback takes this same lock, so it is called with the lock
+            // released (holding it here hung the player on leaving Video Processor).
+            m_st.started = 0;
+            m_st.Unlock();
+            m_input->StopStreams();
+            m_st.Lock();
             StateLog(&m_st, "[DECKLINK][src] card stopped (async teardown path)");
         }
 
@@ -1087,6 +1117,15 @@ void CDeckLinkOutputPin::WorkerLoop()
                     continue;
                 }
             }
+            if (!midStreamModeDiff && m_audioWanted && m_audioCh == 0) {
+                // ClipGuard Media Player: the card's HDMI audio, 48 kHz 32-bit, 8 channels
+                // (2 if the card refuses 8). A refusal only means no sound; the picture is unaffected.
+                HRESULT hrA = m_input->EnableAudioInput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 8);
+                LONG ch = 8;
+                if (FAILED(hrA)) { ch = 2; hrA = m_input->EnableAudioInput(bmdAudioSampleRate48kHz, bmdAudioSampleType32bitInteger, 2); }
+                if (SUCCEEDED(hrA)) InterlockedExchange(&m_audioCh, ch);
+                StateLog(&m_st, "[DECKLINK][src] EnableAudioInput %ld ch hr=0x%08X", SUCCEEDED(hrA) ? ch : 0L, (unsigned)hrA);
+            }
             if (!midStreamModeDiff) {
                 const HRESULT hrS = m_input->StartStreams();
                 m_st.started = (hrS == S_OK);
@@ -1109,6 +1148,7 @@ void CDeckLinkOutputPin::WorkerLoop()
     m_st.enableRetry = 0;
     if (m_st.started)                { m_input->StopStreams();  m_st.started = 0; }
     if (m_st.enabled)                { m_input->DisableVideoInput(); m_st.enabled = 0; }
+    if (m_audioCh)                   { InterlockedExchange(&m_audioCh, 0); m_input->DisableAudioInput(); }
     m_st.Unlock();
     CoUninitialize();
 }
@@ -1249,7 +1289,11 @@ STDMETHODIMP CDeckLinkCaptureCallback::VideoInputFormatChanged(
 STDMETHODIMP CDeckLinkCaptureCallback::VideoInputFrameArrived(
     IDeckLinkVideoInputFrame* videoFrame, IDeckLinkAudioInputPacket* audioPacket)
 {
-    (void)audioPacket;
+    // 2.72.0: during teardown the callback returns at once, without taking any lock, so
+    // a StopStreams waiting for it is never held up.
+    if (m_st->stopPending) return S_OK;
+    if (audioPacket && m_pin->m_audioCh)
+        m_pin->PushAudio(audioPacket, m_st->fpsNum, m_st->fpsDen);   // copy only (CaptureAudio.h)
     if (!videoFrame) return S_OK;
 
     const LONG realW = (LONG)videoFrame->GetWidth();

@@ -441,6 +441,8 @@ public:
 
     // Transport
     HRESULT Open(std::wstring_view source);
+    // ClipGuard: the next Open() starts fresh (no resume) and on these tracks (-1: default).
+    void SetNextOpen(bool fresh, int audioTrack, int subTrack) { openFresh_ = fresh; openAudioTrack_ = audioTrack; openSubTrack_ = subTrack; }
     HRESULT Play();
     HRESULT Pause();
     HRESULT Stop();
@@ -498,6 +500,8 @@ public:
     // when it is registered; otherwise the DSound fallback keeps the default).
     HRESULT GetAudioDevices(std::vector<AudioDeviceInfo>&) const;
     HRESULT SetAudioDevice(const std::wstring& endpointId, const std::wstring& endpointName);
+    // ClipGuard Player (Test): the audio renderer's (0) or LAV Audio's (1) own settings panel.
+    HRESULT ShowAudioFilterProperties(int which, HWND owner);
     HRESULT GetAudioDevice(std::wstring& endpointId, std::wstring& endpointName) const;
 
     // MPCVR-Zion bridges
@@ -841,6 +845,11 @@ private:
     CComPtr<IMediaSeeking> mediaSeeking_;
     CComPtr<IMediaEventEx> mediaEvent_;
     CComPtr<IBaseFilter> splitter_;
+    // ClipGuard: LAV Video of a file graph, for the decoder name in the [live] log
+    // (read on the live thread, so guarded; released before the graph in teardown).
+    std::mutex m_lavMtx;
+    CComPtr<IUnknown> m_lavVideo;
+    void ConfigureLavVideo(IBaseFilter* decoder);
     CComPtr<IBaseFilter> renderer_;
     CComPtr<IBaseFilter> audioDecoder_;
     CComPtr<IBaseFilter> audioRenderer_;
@@ -881,9 +890,14 @@ private:
     bool muted_ = false;
     bool audioEnabled_ = true;
     AudioMode audioMode_ = AudioMode::Bitstream;   // HTPC: bitstream by default
+    bool openFresh_ = false; int openAudioTrack_ = -1, openSubTrack_ = -1;   // ClipGuard: SetNextOpen
+    int audioDelayMs_ = 0;                          // ClipGuard: lip sync (LAV Audio delay, + = audio later)
+    void ApplyAudioDelay();
     BitstreamConfig bitstream_;
     std::wstring audioDeviceId_, audioDeviceName_;
     bool audioRendererIsMpcAudio_ = false;   // true when MpcAudioRenderer won the CoCreate
+    bool audioRendererIsMpcBe_ = false;      // ClipGuard Player: MPC-BE's MpcAudioRenderer.ax (modes: shared / exclusive only)
+    void LogAudioRendererStatus(int afterMs);   // ClipGuard Player: what the renderer is doing, a few seconds in
     // Bumped on every graph build. A new generation means a NEW MPCVR instance
     // that re-read the registry, so the UI must re-push its settings — exposed
     // as "gen" in GetUiStatusJson for exactly that.

@@ -632,11 +632,20 @@ __declspec(dllexport) int s3_cmd(const char* jsonUtf8)
             if (n > 0) MultiByteToWideChar(CP_UTF8, 0, url.c_str(),
                                            (int)url.size(), &wurl[0], n);
         }
+        // ClipGuard: {"fresh":1} starts at the start even for the same file again;
+        // {"atrack":N,"strack":N} start on those streams (audio / subtitle relative).
+        {
+            const std::string fr = JsonField(s, "fresh"), at = JsonField(s, "atrack"), st = JsonField(s, "strack");
+            g_player()->SetNextOpen(fr == "1" || fr == "true",
+                                    at.empty() ? -1 : atoi(at.c_str()), st.empty() ? -1 : atoi(st.c_str()));
+        }
         const HRESULT hr = g_player()->Open(wurl);
         if (SUCCEEDED(hr)) g_player()->Play();
         char why[512];
+        // ClipGuard: the query of a network address (a Plex token) is never logged.
+        const std::wstring shown = wurl.substr(0, wurl.find(L'?'));
         _snprintf_s(why, sizeof(why), _TRUNCATE, "[S3] open url='%S' hr=0x%08X",
-                    wurl.c_str(), (unsigned)hr);
+                    shown.c_str(), (unsigned)hr);
         EngineLog(why);
         return (int)hr;
     }
@@ -719,6 +728,13 @@ __declspec(dllexport) int s3_cmd(const char* jsonUtf8)
         // next presented frame without a graph rebuild.
         const std::string idx = JsonField(s, "index");
         return (int)g_player()->SetSubtitleTrack(idx.empty() ? -1 : atoi(idx.c_str()));
+    }
+    if (a == "props") {
+        // ClipGuard (Test): {"a":"props","f":0|1,"hwnd":N} — the audio renderer's (0) or
+        // LAV Audio's (1) own settings panel, modal; returns when it is closed.
+        const std::string h = JsonField(s, "hwnd");
+        return (int)g_player()->ShowAudioFilterProperties(atoi(JsonField(s, "f").c_str()),
+                                                          reinterpret_cast<HWND>((INT_PTR)_atoi64(h.c_str())));
     }
     // Audio mode (PCM↔Bitstream) rides the "set" path as audio.mode — no action here.
     // Persist the renderer's live settings to MPCVR's own registry key. SetSettings

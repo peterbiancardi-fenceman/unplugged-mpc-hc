@@ -480,6 +480,40 @@ int vf_dl_get_signal_info(VFSignalInfo* out)
     return 0;
 }
 
+/* ClipGuard Media Player 2.71.0: the input's size and frame rate, from the detected
+ * (else current) input mode, without starting a capture. Returns 0 when known. */
+__declspec(dllexport)
+int vf_dl_get_input_format(int* w, int* h, int* fpsNum, int* fpsDen, int* interlaced)
+{
+    LONGLONG mode = 0;
+    IDeckLinkInput* in = NULL;
+    IDeckLinkDisplayMode* dm = NULL;
+    BMDTimeValue dur = 0;
+    BMDTimeScale scale = 0;
+    int rc = -1;
+
+    if (!w || !h || !fpsNum || !fpsDen || !interlaced) return -1;
+    *w = *h = *fpsNum = *fpsDen = *interlaced = 0;
+    if (!g_opened || !g_status || !g_device) return -1;
+    if (FAILED(g_status->lpVtbl->GetInt(g_status, bmdDeckLinkStatusDetectedVideoInputMode, &mode)) || mode == 0)
+        if (FAILED(g_status->lpVtbl->GetInt(g_status, bmdDeckLinkStatusCurrentVideoInputMode, &mode)) || mode == 0)
+            return -2;
+    if (FAILED(g_device->lpVtbl->QueryInterface(g_device, &IID_IDeckLinkInput, (void**)&in)) || !in) return -3;
+    if (SUCCEEDED(in->lpVtbl->GetDisplayMode(in, (BMDDisplayMode)mode, &dm)) && dm) {
+        *w = (int)dm->lpVtbl->GetWidth(dm);
+        *h = (int)dm->lpVtbl->GetHeight(dm);
+        if (SUCCEEDED(dm->lpVtbl->GetFrameRate(dm, &dur, &scale)) && dur > 0) { *fpsNum = (int)scale; *fpsDen = (int)dur; }
+        {
+            const BMDFieldDominance fd = dm->lpVtbl->GetFieldDominance(dm);
+            *interlaced = (fd == bmdLowerFieldFirst || fd == bmdUpperFieldFirst) ? 1 : 0;
+        }
+        dm->lpVtbl->Release(dm);
+        rc = 0;
+    }
+    in->lpVtbl->Release(in);
+    return rc;
+}
+
 __declspec(dllexport)
 void vf_dl_close()
 {

@@ -24,6 +24,7 @@
 #include <dvdmedia.h>
 #include <dxva2api.h>
 #include <evr.h>
+#include <olectl.h>     // OleCreatePropertyFrame (ClipGuard: audio filter panels)
 #include <control.h>   // IQualProp (renderer perf counters)
 #include <mfidl.h>
 #include <audioclient.h>
@@ -33,6 +34,7 @@
 #include <IVideoRenderer.h>
 #include <LAVAudioSettings.h>
 #include <LAVSplitterSettings.h>
+#include <LAVVideoSettings.h>
 #include <atlstr.h>
 #include "MpcAudioRenderer/IMpcAudioRenderer.h"
 #include "DeckLinkSourceControl.h"
@@ -73,6 +75,10 @@ const CLSID CLSID_LAVAudio = {0xE8E73B6B, 0x4CB3, 0x44A4, {0xBE, 0x99, 0x4F, 0x7
 // renderer it shipped with; the DirectSound fallback in ConnectAudio then fires only when
 // ours is genuinely absent.
 const CLSID CLSID_MpcAudioRenderer = {0x7e3a9c24, 0x6b18, 0x4f5d, {0x9a, 0x2e, 0x8c, 0x4b, 0x7d, 0x6f, 0x1a, 0x35}};
+// ClipGuard Player: MPC-BE's own MPC Audio Renderer (standalone MpcAudioRenderer.ax shipped in
+// the player's filters folder). Same IMpcAudioRendererFilter interface; WASAPI exclusive
+// bitstream for TrueHD / Atmos / DTS-HD. Tried first; the chain below is unchanged after it.
+const CLSID CLSID_MpcBeAudioRenderer = {0x601d2a2b, 0x9cde, 0x40bd, {0x86, 0x50, 0x04, 0x85, 0xe3, 0x52, 0x27, 0x27}};
 const CLSID CLSID_DeckLinkSource = {0x8c2f2a32, 0x27b1, 0x4e61, {0xA1, 0xBE, 0x78, 0x84, 0xF2, 0x41, 0x0E, 0x7A}};  // src/thirdparty/DeckLinkSource
 // DeckLink SDK GUIDs the engine needs for device enumeration. The vendored
 // header DECLARES the canonical EXTERN_C names (defined in the filter's own
@@ -594,13 +600,23 @@ HRESULT MpcPlayer::Open(std::wstring_view source)
     // re-open taken at 270 s came back with the renderer at 1.79 s. Capture the position
     // before the old graph dies and restore it below, but only for a re-open of the same
     // source: opening a different file must start at the start.
-    const bool resumeSameSource = !source.empty() && snapshot_.source == source
+    // ClipGuard: an open the user asked for (s3 "open" with "fresh") never resumes:
+    // playing the same film again from the start used to land where it last stopped.
+    const bool fresh = openFresh_;
+    openFresh_ = false;
+    const bool resumeSameSource = !fresh && !source.empty() && snapshot_.source == source
                                && snapshot_.duration > 0 && snapshot_.position > 0;
     const LONGLONG resumePos = resumeSameSource ? (LONGLONG)snapshot_.position : 0;
     if (!resumeSameSource) {
         pendingAudioTrack_ = -1;   // a new file starts from its own default stream
         pendingSubTrack_ = -1;     // ...and its own default (or Off) subtitles
+        // ClipGuard: or from the tracks the caller chose (Plex's selection).
+        if (openAudioTrack_ >= 0) pendingAudioTrack_ = openAudioTrack_;
+        if (openSubTrack_ >= 0) pendingSubTrack_ = openSubTrack_;
+        if (openAudioTrack_ >= 0 || openSubTrack_ >= 0)
+            Log("[GRAPH] Open: starting tracks audio=%d subtitle=%d", openAudioTrack_, openSubTrack_);
     }
+    openAudioTrack_ = openSubTrack_ = -1;
     if (resumeSameSource) {
         Log("[GRAPH] Open: re-open of the same source at %.1f s — position will be restored",
             resumePos / 10000000.0);
@@ -948,6 +964,7 @@ void MpcPlayer::Shutdown()
     // down there (filter and presenter are one aggregate; the presenter's destructor
     // unhooks the filter, so renderer_ is the last reference dropped).
     if (subAP_) subAP_->SetSubPicProvider(nullptr);
+    { std::lock_guard<std::mutex> lk(m_lavMtx); m_lavVideo.Release(); }
     graph_.Release();
     mediaControl_.Release();
     mediaSeeking_.Release();
@@ -1492,6 +1509,19 @@ HRESULT MpcPlayer::GetBitstreamConfig(BitstreamConfig& b) const
     return S_OK;
 }
 
+// ClipGuard: the lip-sync delay on LAV Audio (kept across re-opens: applied again at connect).
+void MpcPlayer::ApplyAudioDelay()
+{
+    if (!audioDecoder_) return;
+    CComQIPtr<ILAVAudioSettings> las = audioDecoder_;
+    if (!las) return;
+    // 2.63.6: no SetRuntimeConfig here. LAV reloads its defaults on that call, which wiped
+    // the bitstream codecs ApplyBitstreamConfig had just set (it runs first and has already
+    // put LAV in runtime mode).
+    const HRESULT hr = las->SetAudioDelay(audioDelayMs_ != 0 ? TRUE : FALSE, audioDelayMs_);
+    Log("[AUDIO] delay %d ms hr=0x%08X", audioDelayMs_, (unsigned)hr);
+}
+
 HRESULT MpcPlayer::ApplyBitstreamConfig()
 {
     if (!audioDecoder_) return S_FALSE;
@@ -1535,9 +1565,70 @@ HRESULT MpcPlayer::ApplyBitstreamConfig()
         on ? "bitstream" : "PCM", drcEnabled ? 1 : 0, drcLevel,
         las->GetMixingEnabled() ? 1 : 0, (unsigned)las->GetMixingLayout(),
         (unsigned)las->GetMixingFlags());
+    ApplyAudioDelay();
     // Keep the audio renderer in sync (mode change while playing).
     ApplyRendererConfig();
     return S_OK;
+}
+
+// ClipGuard Player (Test): open the filter's own property pages, modal, owned by the
+// player's window. 0 = the audio renderer (MPC-BE's MPC Audio Renderer), 1 = LAV Audio.
+HRESULT MpcPlayer::ShowAudioFilterProperties(int which, HWND owner)
+{
+    CComPtr<IBaseFilter> f = which == 0 ? audioRenderer_ : audioDecoder_;
+    if (!f) { Log("[AUDIO] properties %d: no filter (nothing playing)", which); return E_POINTER; }
+    CComQIPtr<ISpecifyPropertyPages> spp = f;
+    if (!spp) { Log("[AUDIO] properties %d: the filter has no settings panel", which); return E_NOINTERFACE; }
+    CAUUID pages = {};
+    HRESULT hr = spp->GetPages(&pages);
+    if (FAILED(hr) || pages.cElems == 0) {
+        if (pages.pElems) CoTaskMemFree(pages.pElems);
+        Log("[AUDIO] properties %d: GetPages hr=0x%08X", which, (unsigned)hr);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    FILTER_INFO fi = {};
+    f->QueryFilterInfo(&fi);
+    if (fi.pGraph) fi.pGraph->Release();
+    IUnknown* unk = f;
+    Log("[AUDIO] properties %d: open '%S' (%lu pages)", which, fi.achName, (unsigned long)pages.cElems);
+    // 2.63.7: the filters are loaded straight from their files (not registered), so COM
+    // cannot find their property pages by CLSID: OleCreatePropertyFrame failed E_FAIL for
+    // MPC-BE's renderer. Each page's class factory, taken from the filter's own module, is
+    // registered in this process for as long as the panel is open.
+    std::vector<DWORD> cookies;
+    {
+        HMODULE mod = nullptr;
+        const void* vtbl = *reinterpret_cast<void* const*>(static_cast<IUnknown*>(f));
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCWSTR>(vtbl), &mod) && mod) {
+            using PfnGetClassObject = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, void**);
+            const auto gco = reinterpret_cast<PfnGetClassObject>(GetProcAddress(mod, "DllGetClassObject"));
+            for (ULONG i = 0; gco && i < pages.cElems; i++) {
+                CComPtr<IClassFactory> cf;
+                if (SUCCEEDED(gco(pages.pElems[i], IID_IClassFactory, reinterpret_cast<void**>(&cf))) && cf) {
+                    DWORD cookie = 0;
+                    const HRESULT hrR = CoRegisterClassObject(pages.pElems[i], cf, CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE, &cookie);
+                    if (SUCCEEDED(hrR)) cookies.push_back(cookie);
+                    Log("[AUDIO] properties %d: page %lu class registered hr=0x%08X", which, (unsigned long)i, (unsigned)hrR);
+                }
+            }
+        }
+    }
+    hr = OleCreatePropertyFrame(owner, 0, 0, fi.achName[0] ? fi.achName : L"Audio",
+                                1, &unk, pages.cElems, pages.pElems, 0, 0, nullptr);
+    for (DWORD c : cookies) CoRevokeClassObject(c);
+    CoTaskMemFree(pages.pElems);
+    Log("[AUDIO] properties %d: closed hr=0x%08X", which, (unsigned)hr);
+    if (which == 1) {
+        CComQIPtr<ILAVAudioSettings> las = audioDecoder_;
+        if (las) {
+            Log("[AUDIO] LAV bitstream now AC3=%d EAC3=%d TrueHD=%d DTS=%d DTSHD=%d",
+                las->GetBitstreamConfig(Bitstream_AC3) ? 1 : 0, las->GetBitstreamConfig(Bitstream_EAC3) ? 1 : 0,
+                las->GetBitstreamConfig(Bitstream_TRUEHD) ? 1 : 0, las->GetBitstreamConfig(Bitstream_DTS) ? 1 : 0,
+                las->GetBitstreamConfig(Bitstream_DTSHD) ? 1 : 0);
+        }
+    }
+    return hr;
 }
 
 HRESULT MpcPlayer::SetAudioDevice(const std::wstring& endpointId, const std::wstring& endpointName)
@@ -1712,7 +1803,18 @@ HRESULT MpcPlayer::ConnectAudio(IBaseFilter* splitter)
     CComPtr<IBaseFilter> audioRenderer;
     // Prefer the registered MpcAudioRenderer (WASAPI device routing + bitstream).
     // Falls back to the system DirectSound renderer when it is not registered.
-    HRESULT hrC = audioRenderer.CoCreateInstance(CLSID_MpcAudioRenderer);
+    HRESULT hrC = E_FAIL;
+    audioRendererIsMpcBe_ = false;
+    {
+        const std::wstring be = BundledFilterPath(L"MpcAudioRenderer.ax");
+        if (!be.empty() && GetFileAttributesW(be.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            hrC = CreateFromModule(be, CLSID_MpcBeAudioRenderer, &audioRenderer);
+            Log("[AUDIO] MPC-BE MpcAudioRenderer.ax hr=0x%08X", (unsigned)hrC);
+            if (FAILED(hrC)) audioRenderer.Release();
+            else audioRendererIsMpcBe_ = true;
+        }
+    }
+    if (FAILED(hrC)) hrC = audioRenderer.CoCreateInstance(CLSID_MpcAudioRenderer);
     audioRendererIsMpcAudio_ = SUCCEEDED(hrC);
     if (FAILED(hrC)) {
         audioRendererIsMpcAudio_ = false;
@@ -1728,6 +1830,21 @@ HRESULT MpcPlayer::ConnectAudio(IBaseFilter* splitter)
     if (FAILED(hrD)) {
         graph_->RemoveFilter(audioDecoder);
         return S_FALSE;
+    }
+
+    // ClipGuard Player: MPC-BE's renderer is set to Exclusive BEFORE the pins connect, so the
+    // format checks LAV makes (bitstream and PCM) are answered for exclusive mode. Its own
+    // modes are only Shared / Exclusive; it switches to bitstream by itself when LAV sends
+    // IEC 61937 (MODE_WASAPI_EXCLUSIVE_BITSTREAM is its internal status, not a setting).
+    if (audioRendererIsMpcBe_) {
+        CComQIPtr<IMpcAudioRendererFilter> mbe = audioRenderer;
+        if (mbe) {
+            mbe->SetWasapiMode(MODE_WASAPI_EXCLUSIVE);
+            mbe->SetBitExactOutput(TRUE);
+            if (!audioDeviceId_.empty()) mbe->SetDeviceId(CString(audioDeviceId_.c_str()), CString(audioDeviceName_.c_str()));
+            const HRESULT ahr = mbe->Apply();
+            Log("[AUDIO] MPC-BE renderer set to Exclusive before connect apply=0x%08X", (unsigned)ahr);
+        }
     }
 
     // Apply LAV bitstream config BEFORE pin connect (LAV requirement).
@@ -1775,7 +1892,37 @@ HRESULT MpcPlayer::ConnectAudio(IBaseFilter* splitter)
     // Apply mode + device to the audio renderer NOW (before Run), then hand the
     // LAV decoder its bitstream config so both halves agree on the output.
     ApplyRendererConfig();
+    if (audioRendererIsMpcBe_) { LogAudioRendererStatus(3000); LogAudioRendererStatus(8000); }
     return S_OK;
+}
+
+// ClipGuard Player: log what MPC-BE's renderer is actually doing (mode, bitstream format,
+// device, input / output formats), afterMs after the graph is built.
+void MpcPlayer::LogAudioRendererStatus(int afterMs)
+{
+    CComQIPtr<IMpcAudioRendererFilter> mar = audioRenderer_;
+    if (!mar) return;
+    const uint32_t gen = graphGen_;
+    IMpcAudioRendererFilter* raw = mar.Detach();   // the thread owns this reference
+    std::thread([this, raw, gen, afterMs]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        Sleep(afterMs);
+        if (gen == graphGen_) {
+            static const char* modes[] = { "shared", "exclusive", "exclusive-bitstream", "none" };
+            static const char* bs[] = { "none", "AC3", "DTS", "EAC3", "TrueHD", "DTS-HD" };
+            const UINT m = raw->GetMode();
+            const int b = (int)raw->GetBitstreamMode();
+            WAVEFORMATEX* in = nullptr;
+            WAVEFORMATEX* out = nullptr;
+            raw->GetStatus(&in, &out);
+            Log("[AUDIO] MPC-BE status +%dms: mode=%s bitstream=%s in=tag 0x%04X %uch %luHz %ubit out=tag 0x%04X %uch %luHz %ubit",
+                afterMs, m < 4 ? modes[m] : "?", (b >= 0 && b < 6) ? bs[b] : "?",
+                in ? in->wFormatTag : 0, in ? in->nChannels : 0, in ? in->nSamplesPerSec : 0, in ? in->wBitsPerSample : 0,
+                out ? out->wFormatTag : 0, out ? out->nChannels : 0, out ? out->nSamplesPerSec : 0, out ? out->wBitsPerSample : 0);
+        }
+        raw->Release();
+        CoUninitialize();
+    }).detach();
 }
 
 HRESULT MpcPlayer::ApplyRendererConfig()
@@ -1785,8 +1932,14 @@ HRESULT MpcPlayer::ApplyRendererConfig()
     if (!mar) return S_FALSE;
 
     const bool bitstream = audioMode_ == AudioMode::Bitstream;
-    mar->SetWasapiMode(bitstream ? MODE_WASAPI_EXCLUSIVE_BITSTREAM : MODE_WASAPI_SHARED);
-    mar->SetBitExactOutput(bitstream ? TRUE : FALSE);
+    if (audioRendererIsMpcBe_) {
+        // MPC-BE: Exclusive always (bitstream follows by itself, PCM goes straight out).
+        mar->SetWasapiMode(MODE_WASAPI_EXCLUSIVE);
+        mar->SetBitExactOutput(TRUE);
+    } else {
+        mar->SetWasapiMode(bitstream ? MODE_WASAPI_EXCLUSIVE_BITSTREAM : MODE_WASAPI_SHARED);
+        mar->SetBitExactOutput(bitstream ? TRUE : FALSE);
+    }
 
     // Log the RAW configured value first: every silence diagnosis so far has been
     // guesswork about what the UI or an INI pushed, and this one line ends that.
@@ -1880,12 +2033,22 @@ HRESULT MpcPlayer::BuildGraph(std::wstring_view source)
     // DeckLink HDMI capture: LAVSplitterSource demuxes the decklink:// URL
     // itself (video-only — no_audio). No separate splitter, no audio path.
     const bool bDeckLink = (_wcsnicmp(source.data(), L"decklink://", 11) == 0);
-    Log("[DECKLINK][engine] BuildGraph bDeckLink=%d source='%.*S'", (int)bDeckLink, 140, source.data());
+    {   // ClipGuard: never log a network address's query (a Plex URL carries the token there).
+        const size_t q = source.find(L'?');
+        const size_t end = (q == std::wstring_view::npos) ? source.size() : q;
+        const int shown = (int)(end < 140 ? end : 140);
+        Log("[DECKLINK][engine] BuildGraph bDeckLink=%d source='%.*S'", (int)bDeckLink, shown, source.data());
+    }
     if (bDeckLink) decklinkUrl_ = std::wstring(source);   // the filter-driven restart re-opens this
 
     CComPtr<IBaseFilter> sourceFilter;
     CComPtr<IBaseFilter> splitter;
     bool bDeckLinkDirect = false;
+    // ClipGuard: an http(s) address (a Plex server's direct-play URL) streams through
+    // LAV Splitter Source, which reads and demuxes it itself. AddSourceFilter would hand
+    // it to Windows' File Source (URL), which downloads the whole file first.
+    const bool bNet = !bDeckLink && (_wcsnicmp(source.data(), L"http://", 7) == 0 ||
+                                     _wcsnicmp(source.data(), L"https://", 8) == 0);
     if (bDeckLink) {
         // Direct ingest (phase 3): our DeckLinkSource filter CoCreates when it
         // is registered — v210 output pin → MPCVR directly, no ffmpeg/LAV in the
@@ -1964,7 +2127,18 @@ HRESULT MpcPlayer::BuildGraph(std::wstring_view source)
         // machine with a codec pack. File Source (Async) is exactly what AddSourceFilter
         // returns on a clean machine, so the graph is unchanged there.
         const std::wstring path(source);
-        if (path.find(L"://") == std::wstring::npos) {
+        if (bNet) {
+            hr = CreateBundledFilter(CLSID_LAVSplitterSource, L"LAVSplitter.ax", "LAV Splitter Source", sourceFilter);
+            if (FAILED(hr)) return hr;
+            hr = graph_->AddFilter(sourceFilter, L"LAV Splitter Source");
+            if (FAILED(hr)) return hr;
+            CComQIPtr<IFileSourceFilter> pFS = sourceFilter;
+            if (!pFS) return E_NOINTERFACE;
+            hr = pFS->Load(path.c_str(), nullptr);
+            Log("[GRAPH] LAV Splitter Source Load(network) hr=0x%08X", (unsigned)hr);
+            if (FAILED(hr)) return hr;
+            splitter = sourceFilter;   // reads and demuxes in one
+        } else if (path.find(L"://") == std::wstring::npos) {
             hr = sourceFilter.CoCreateInstance(CLSID_AsyncReader);
             if (FAILED(hr)) { Log("[GRAPH] CoCreate File Source (Async) FAILED hr=0x%08X", (unsigned)hr); return hr; }
             hr = graph_->AddFilter(sourceFilter, L"source");
@@ -1979,16 +2153,19 @@ HRESULT MpcPlayer::BuildGraph(std::wstring_view source)
             Log("[GRAPH] AddSourceFilter(url) hr=0x%08X", (unsigned)hr);
             if (FAILED(hr)) return hr;
         }
-        hr = CreateBundledFilter(CLSID_LAVSplitter, L"LAVSplitter.ax", "LAV Splitter", splitter);
-        if (FAILED(hr)) return hr;
-        hr = graph_->AddFilter(splitter, L"LAV Splitter");
-        if (FAILED(hr)) return hr;
+        if (!bNet) {
+            hr = CreateBundledFilter(CLSID_LAVSplitter, L"LAVSplitter.ax", "LAV Splitter", splitter);
+            if (FAILED(hr)) return hr;
+            hr = graph_->AddFilter(splitter, L"LAV Splitter");
+            if (FAILED(hr)) return hr;
+        }
     }
 
     CComPtr<IBaseFilter> decoder;
     if (!bDeckLinkDirect) {
         hr = CreateBundledFilter(CLSID_LAVVideo, L"LAVVideo.ax", "LAV Video", decoder);
         if (FAILED(hr)) return hr;
+        if (!bDeckLink) ConfigureLavVideo(decoder);   // ClipGuard: GPU decoding for files
         hr = graph_->AddFilter(decoder, L"LAV Video");
         if (FAILED(hr)) return hr;
     }
@@ -2100,12 +2277,14 @@ HRESULT MpcPlayer::BuildGraph(std::wstring_view source)
         if (FAILED(hr)) return hr;
         Log("[DECKLINK][engine] DeckLink graph: source->decoder connected (no audio)");
     } else {
-        CComPtr<IPin> srcOut = FindPin(sourceFilter, PINDIR_OUTPUT);
-        CComPtr<IPin> splIn = FindPin(splitter, PINDIR_INPUT);
-        if (!srcOut || !splIn) return E_POINTER;
-        hr = ConnectPinsDirect(srcOut, splIn, "source -> LAV Splitter");
-        Log("[GRAPH] connect source -> LAV Splitter hr=0x%08X", (unsigned)hr);
-        if (FAILED(hr)) return hr;
+        if (!bNet) {
+            CComPtr<IPin> srcOut = FindPin(sourceFilter, PINDIR_OUTPUT);
+            CComPtr<IPin> splIn = FindPin(splitter, PINDIR_INPUT);
+            if (!srcOut || !splIn) return E_POINTER;
+            hr = ConnectPinsDirect(srcOut, splIn, "source -> LAV Splitter");
+            Log("[GRAPH] connect source -> LAV Splitter hr=0x%08X", (unsigned)hr);
+            if (FAILED(hr)) return hr;
+        }
 
         CComPtr<IPin> splOut = FindPin(splitter, PINDIR_OUTPUT);
         CComPtr<IPin> decIn = FindPin(decoder, PINDIR_INPUT);
@@ -2254,6 +2433,25 @@ HRESULT MpcPlayer::BuildGraph(std::wstring_view source)
     RebuildAudioJson();
     RebuildSubtitleJson();
     return S_OK;
+}
+
+// ClipGuard: LAV Video decodes films on the GPU (D3D11; native to MPCVR, LAV falls back
+// to copy-back or the CPU by itself when it must). Runtime config: our own settings for
+// this instance, nothing read from or written to LAV's registry. Before any connect.
+void MpcPlayer::ConfigureLavVideo(IBaseFilter* decoder)
+{
+    CComQIPtr<ILAVVideoSettings> lav = decoder;
+    if (!lav) { Log("[LAVV] ILAVVideoSettings unavailable -- LAV's own settings stand"); return; }
+    HRESULT h0 = lav->SetRuntimeConfig(TRUE);
+    HRESULT h1 = lav->SetHWAccel(HWAccel_D3D11);
+    const LAVVideoHWCodec codecs[] = { HWCodec_H264, HWCodec_VC1, HWCodec_MPEG2, HWCodec_HEVC, HWCodec_VP9, HWCodec_AV1 };
+    for (LAVVideoHWCodec c : codecs) lav->SetHWAccelCodec(c, TRUE);
+    HRESULT h2 = lav->SetHWAccelResolutionFlags(LAVHWResFlag_SD | LAVHWResFlag_HD | LAVHWResFlag_UHD);
+    const DWORD support = lav->CheckHWAccelSupport(HWAccel_D3D11);
+    Log("[LAVV] runtime config hr=0x%08X, hwaccel D3D11 hr=0x%08X, res hr=0x%08X, D3D11 support=%lu",
+        (unsigned)h0, (unsigned)h1, (unsigned)h2, (unsigned long)support);
+    std::lock_guard<std::mutex> lk(m_lavMtx);
+    m_lavVideo = decoder;
 }
 
 HRESULT MpcPlayer::CreateBundledFilter(REFCLSID clsid, const wchar_t* file, const char* name,
@@ -4303,6 +4501,14 @@ void MpcPlayer::RefreshLive()
             const wchar_t* miv = wcsstr(pipe.c_str(), L"mmin=");
             if (miv) m_liveMdrMmin = (int)wcstol(miv + 5, nullptr, 10);
         }
+        {   // ClipGuard: which decoder LAV Video is really using (GPU or CPU).
+            std::lock_guard<std::mutex> lk(m_lavMtx);
+            if (m_lavVideo) {
+                CComQIPtr<ILAVVideoStatus> st = m_lavVideo;
+                LPCWSTR name = st ? st->GetActiveDecoderName() : nullptr;
+                Log("[live] decoder: %ls", name ? name : L"?");
+            }
+        }
         Log("[live] recv=%u draw=%.1f lag=%.0fms renderer=%d pipeline:%ls src=%dx%d@%d/%d gateDrops=%llu",
             r.framesReceived, r.drawFps, r.presentLatencyMs, renderer_ != nullptr,
             pipe.empty() ? L" ?" : pipe.c_str(),
@@ -4923,6 +5129,12 @@ HRESULT MpcPlayer::ApplySettingsFlat(const std::vector<std::string>& sets)
                     Log("[ENGINE] audio mode -> %s; re-open queued to apply at connect",
                         want == AudioMode::Bitstream ? "Bitstream" : "PCM");
                 }
+            }
+            else if (name == "delay") {
+                // ClipGuard: lip sync. LAV Audio shifts the audio's timestamps by this many
+                // ms (+ = audio later), PCM and bitstream alike, live without a rebuild.
+                audioDelayMs_ = (int)std::clamp(vd(v), -2000.0, 2000.0);
+                ApplyAudioDelay();
             }
             else hit = false;
         }
