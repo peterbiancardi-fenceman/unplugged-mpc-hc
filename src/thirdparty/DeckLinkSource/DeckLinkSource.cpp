@@ -17,10 +17,12 @@
 #include <cstdio>      // vsnprintf
 #include <string.h>
 #include <thread>      // std::thread (capture-session worker)
+#include <mutex>       // 1.1.0: Low latency's clock
 
 #include "DeckLinkAPI_h.h"   // DeckLink C++ SDK (vendored; GUIDs live in DeckLinkAPI_i.c)
 #include "DeckLinkSourceControl.h"   // IDeckLinkSourceControl (engine control surface)
 #include "CaptureAudio.h"            // ClipGuard Media Player: the card's HDMI audio (only when asked)
+#include "IMediaSideData.h"          // 1.1.0: per-frame timing for the renderer's latency readout
 
 // Values from DeckLink SDK 14.2 (DeckLinkAPI.h) that this vendored header
 // predates. They are stable ABI — a detected-colours-space fourcc, a frame
@@ -80,6 +82,23 @@ EXTERN_C const GUID MEDIASUBTYPE_P210;
 // transfer to the correction pass; UpdateCorrectionShader builds the full
 // converter when the VP is absent), verified live with every dial moving.
 // DECKLINK_P210=0 reverts to P010 (4:2:0, hardware-VP path) with no rebuild.
+// ClipGuard Media Player 1.1.0: when each frame arrived from the card, was queued for the forwarder
+// and was handed to the renderer (QueryPerformanceCounter ticks); the renderer adds when it drew it
+// and shows the capture-to-display time. Same GUID and layout in the renderer.
+static const GUID kIID_CgTiming = { 0x7e3a9c41, 0x2b6d, 0x4f0e, { 0x8c, 0x15, 0x93, 0xd2, 0xa6, 0xb4, 0xe7, 0x11 } };
+struct CgTiming { LONGLONG arrive, enqueue, deliver; };
+
+// 1.1.0: Low latency (Video Processor). Each frame is stamped with the playback clock's time when
+// the card delivered it, plus two thirds of a frame, so the renderer shows it within a refresh
+// instead of on a schedule that started at the first frame. No frame is dropped.
+// CLIPGUARD_LOW_LATENCY=1 (set by the player), read for every frame.
+static bool LowLatencyOn()
+{
+    char b[4] = {};
+    const DWORD n = GetEnvironmentVariableA("CLIPGUARD_LOW_LATENCY", b, (DWORD)sizeof(b));
+    return n > 0 && n < sizeof(b) && b[0] == '1';
+}
+
 static bool UseP210()
 {
     static const bool on = []() {
@@ -287,6 +306,29 @@ public:
     CaptureAudio m_audio;
     bool m_audioWanted = false;
     volatile LONG m_audioCh = 0;
+    // 1.1.0: Low latency -- the running graph's clock and start time (set in Run, cleared in
+    // Pause / Stop) and the last stamp given (callback only).
+    std::mutex m_clkMx;
+    IReferenceClock* m_runClock = nullptr;
+    REFERENCE_TIME m_runStart = 0;
+    REFERENCE_TIME m_llLastRt = 0;
+    bool m_llHaveLast = false;
+    void SetRunClock(IReferenceClock* c, REFERENCE_TIME t)
+    {
+        std::lock_guard<std::mutex> l(m_clkMx);
+        if (m_runClock) m_runClock->Release();
+        m_runClock = c;
+        if (c) c->AddRef();
+        m_runStart = t;
+    }
+    bool StreamNow(REFERENCE_TIME& rt)
+    {
+        std::lock_guard<std::mutex> l(m_clkMx);
+        REFERENCE_TIME now = 0;
+        if (!m_runClock || FAILED(m_runClock->GetTime(&now))) return false;
+        rt = now - m_runStart;
+        return true;
+    }
     void PushAudio(IDeckLinkAudioInputPacket* pkt, LONG fpsNum, LONG fpsDen) {
         const LONG ch = m_audioCh;
         if (!pkt || ch == 0) return;
@@ -1190,6 +1232,16 @@ void CDeckLinkOutputPin::ForwardLoop()
         else if (quit) { m_st.Unlock(); break; }
         m_st.Unlock();
         if (s) {
+            if (active) {
+                // 1.1.0: stamp the hand-off to the renderer
+                CComQIPtr<IMediaSideData> sdT(s);
+                const BYTE* tp = nullptr; size_t tn = 0;
+                if (sdT && SUCCEEDED(sdT->GetSideData(kIID_CgTiming, &tp, &tn)) && tp && tn == sizeof(CgTiming)) {
+                    CgTiming t; memcpy(&t, tp, sizeof(t));
+                    LARGE_INTEGER q; QueryPerformanceCounter(&q); t.deliver = q.QuadPart;
+                    sdT->SetSideData(kIID_CgTiming, (const BYTE*)&t, sizeof(t));
+                }
+            }
             if (active) Deliver(s);             // may block on the renderer — never the card
             s->Release();
         }
@@ -1295,6 +1347,9 @@ STDMETHODIMP CDeckLinkCaptureCallback::VideoInputFrameArrived(
     if (audioPacket && m_pin->m_audioCh)
         m_pin->PushAudio(audioPacket, m_st->fpsNum, m_st->fpsDen);   // copy only (CaptureAudio.h)
     if (!videoFrame) return S_OK;
+    LARGE_INTEGER cgArrive; QueryPerformanceCounter(&cgArrive);   // 1.1.0: the frame is here
+    REFERENCE_TIME llNow = 0;                                      // 1.1.0: the playback clock now
+    const bool llRetime = LowLatencyOn() && m_pin->StreamNow(llNow);
 
     const LONG realW = (LONG)videoFrame->GetWidth();
     const LONG realH = (LONG)videoFrame->GetHeight();
@@ -1579,7 +1634,17 @@ STDMETHODIMP CDeckLinkCaptureCallback::VideoInputFrameArrived(
                 (unsigned)hrG, dst, sampleBytes);
         }
         REFERENCE_TIME rtStart = rtRelUs * 10;             // µs -> 100 ns (graph-relative)
-        REFERENCE_TIME rtEnd = rtStart + (10000000LL * fpsDen) / fpsNum;
+        const REFERENCE_TIME frameDur = (10000000LL * fpsDen) / fpsNum;
+        if (llRetime) {
+            // 1.1.0: Low latency -- due two thirds of a frame after it arrived, never before the
+            // last frame's time.
+            rtStart = llNow + frameDur * 2 / 3;
+            if (m_pin->m_llHaveLast && rtStart <= m_pin->m_llLastRt) rtStart = m_pin->m_llLastRt + 1;
+            m_pin->m_llLastRt = rtStart; m_pin->m_llHaveLast = true;
+        } else {
+            m_pin->m_llHaveLast = false;
+        }
+        REFERENCE_TIME rtEnd = rtStart + frameDur;
         pSample->SetTime(&rtStart, &rtEnd);
         pSample->SetDiscontinuity(isFirstDlv);   // first *delivered* frame re-cues
         m_st->Lock();
@@ -1588,6 +1653,14 @@ STDMETHODIMP CDeckLinkCaptureCallback::VideoInputFrameArrived(
             StateLog(m_st, "[DECKLINK][src] FIRST FRAME DELIVERED (rtStart=%lld us)",
                 (long long)refTime);
         m_st->Unlock();
+        {   // 1.1.0: arrival and queueing times, for the renderer's latency readout
+            CComQIPtr<IMediaSideData> sdT(pSample);
+            if (sdT) {
+                CgTiming t{}; t.arrive = cgArrive.QuadPart;
+                LARGE_INTEGER q; QueryPerformanceCounter(&q); t.enqueue = q.QuadPart;
+                sdT->SetSideData(kIID_CgTiming, (const BYTE*)&t, sizeof(t));
+            }
+        }
         // Hand off to the forwarder — the SDK thread never blocks on Deliver.
         if (!m_pin->EnqueueSample(pSample)) pSample->Release();
     }
@@ -1611,9 +1684,28 @@ public:
     }
     ~CDeckLinkSource() {
         if (m_pPin) {
+            m_pPin->SetRunClock(nullptr, 0);   // 1.1.0
             m_pPin->StopCaptureSession();
             delete m_pPin;
         }
+    }
+
+    // 1.1.0: Low latency needs the running graph's clock and start time.
+    STDMETHODIMP Run(REFERENCE_TIME tStart) override
+    {
+        const HRESULT hr = CBaseFilter::Run(tStart);
+        if (SUCCEEDED(hr) && m_pPin) m_pPin->SetRunClock(m_pClock, tStart);
+        return hr;
+    }
+    STDMETHODIMP Pause() override
+    {
+        if (m_pPin) m_pPin->SetRunClock(nullptr, 0);
+        return CBaseFilter::Pause();
+    }
+    STDMETHODIMP Stop() override
+    {
+        if (m_pPin) m_pPin->SetRunClock(nullptr, 0);
+        return CBaseFilter::Stop();
     }
 
     STDMETHODIMP NonDelegatingQueryInterface(REFIID riid, void** ppv) override
